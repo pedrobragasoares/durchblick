@@ -156,6 +156,9 @@ public:
         }
     }
 
+    /// Called when a press turned into a drag, so the release must not count as a click
+    virtual void CancelClick() { }
+
     bool IsMouseOver(int x, int y)
     {
         m_mouse_over = x >= m_rel_left && x < m_rel_right && y >= m_rel_top && y < m_rel_bottom;

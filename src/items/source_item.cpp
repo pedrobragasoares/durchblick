@@ -98,6 +98,23 @@ bool SourceItem::IsPlaceholder(obs_source_t* src)
     return !src || src == placeholder_source;
 }
 
+void SourceItem::ApplySourceRef(SourceRef const& ref)
+{
+    if (!IsPlaceholder(ref.src)) {
+        SetSource(ref.src);
+        return;
+    }
+    SetSource(placeholder_source);
+    m_source_name = ref.name;
+    ResolveSource();
+}
+
+void SourceItem::ClearSource()
+{
+    SetSource(placeholder_source);
+    m_source_name.clear();
+}
+
 bool SourceItem::ResolveSource()
 {
     if (!IsPlaceholder(m_src))

@@ -165,6 +165,19 @@ public:
     }
 
     OBSSource GetSource() { return m_src; }
+    QString const& SourceName() const { return m_source_name; }
+
+    // A cell's source together with its saved name (the source may be the
+    // placeholder while the name is still known). Used to move sources
+    // between cells.
+    struct SourceRef {
+        OBSSource src;
+        QString name;
+        bool IsEmpty() const { return SourceItem::IsPlaceholder(src) && name.isEmpty(); }
+    };
+    SourceRef GetSourceRef() const { return { m_src, m_source_name }; }
+    void ApplySourceRef(SourceRef const& ref);
+    void ClearSource();
 
     virtual void ReadFromJson(QJsonObject const& Obj) override;
     virtual void WriteToJson(QJsonObject& Obj) override;

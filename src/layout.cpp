@@ -24,6 +24,7 @@
 #include "items/source_item.hpp"
 #include "ui/durchblick.hpp"
 #include "util/util.h"
+#include <QApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -62,6 +63,11 @@ void Layout::FillEmptyCells()
 LayoutItem::Cell Layout::GetSelectedArea()
 {
     LayoutItem::Cell target = m_hovered_cell;
+
+    if (m_moving) {
+        DrawOutline(m_move_source, COLOR_SELECTION_CYAN);
+        DrawOutline(m_move_target, COLOR_PREVIEW_INDICATOR);
+    }
 
     if (m_dragging) {
         int tx, ty, cx, cy;
@@ -127,6 +133,8 @@ void Layout::FillSelectionWithScenes()
                 continue;
 
             std::string n(obs_source_get_name(src));
+            if (m_hidden_scenes.contains(utf8_to_qt(n.c_str())))
+                continue;
             auto exists = std::find_if(existing_scenes.begin(), existing_scenes.end(), [n](std::string const& name) {
                 return n == name;
             });
@@ -168,7 +176,7 @@ Layout::~Layout()
 {
 }
 
-void Layout::MouseMoved(QMouseEvent* e)
+LayoutItem::MouseData Layout::MakeMouseData(QMouseEvent* e)
 {
     LayoutItem::MouseData d(
         int((e->pos().x() - m_cfg.x) / m_cfg.scale),
@@ -177,10 +185,76 @@ void Layout::MouseMoved(QMouseEvent* e)
         e->buttons(),
         e->type());
 
-    auto* screen = m_durchblick->windowHandle()->screen();
+    // Apply the display scaling for every event, not just mouse moves,
+    // otherwise clicks land on the wrong cell with Windows scaling > 100%
+    auto* handle = m_durchblick->windowHandle();
+    auto* screen = handle ? handle->screen() : nullptr;
     if (screen) {
         d.x *= screen->devicePixelRatio();
         d.y *= screen->devicePixelRatio();
+    }
+    return d;
+}
+
+LayoutItem::Cell Layout::CellAt(LayoutItem::MouseData const& d) const
+{
+    LayoutItem::Cell c;
+    if (m_cfg.cell_width <= 0 || m_cfg.cell_height <= 0)
+        return c;
+    c.col = qBound(0, int(d.x / m_cfg.cell_width), m_cols - 1);
+    c.row = qBound(0, int(d.y / m_cfg.cell_height), m_rows - 1);
+    return c;
+}
+
+LayoutItem* Layout::ItemAt(int col, int row)
+{
+    LayoutItem::Cell c;
+    c.col = col;
+    c.row = row;
+    for (auto& item : m_layout_items) {
+        if (item->m_cell.Overlaps(c))
+            return item.get();
+    }
+    return nullptr;
+}
+
+void Layout::MouseMoved(QMouseEvent* e)
+{
+    auto d = MakeMouseData(e);
+
+    // Left button held on a cell: start moving it once the mouse traveled far enough
+    if (m_lmb_pressed && !m_locked && (e->buttons() & Qt::LeftButton)) {
+        if (!m_moving && (e->pos() - m_press_pos).manhattanLength() >= QApplication::startDragDistance()) {
+            std::lock_guard<std::mutex> lock(m_layout_mutex);
+            auto press_cell = m_move_source;
+            auto* item = ItemAt(press_cell.col, press_cell.row);
+            if (item && !dynamic_cast<PlaceholderItem*>(item)) {
+                m_moving = true;
+                m_move_source = item->m_cell;
+                for (auto& Item : m_layout_items)
+                    Item->CancelClick();
+            } else {
+                m_lmb_pressed = false;
+            }
+        }
+        if (m_moving) {
+            auto c = CellAt(d);
+            m_move_target = c;
+            {
+                // Show the target with the size of the moved cell
+                std::lock_guard<std::mutex> lock(m_layout_mutex);
+                auto* target = ItemAt(c.col, c.row);
+                if (target && target->m_cell.w == m_move_source.w && target->m_cell.h == m_move_source.h)
+                    m_move_target = target->m_cell;
+                else {
+                    m_move_target.w = m_move_source.w;
+                    m_move_target.h = m_move_source.h;
+                }
+            }
+            for (auto& Item : m_layout_items)
+                Item->MouseEvent(d, m_cfg);
+            return;
+        }
     }
 
     LayoutItem::Cell pos;
@@ -209,12 +283,7 @@ void Layout::MouseMoved(QMouseEvent* e)
 
 void Layout::MousePressed(QMouseEvent* e)
 {
-    LayoutItem::MouseData d(
-        int((e->pos().x() - m_cfg.x) / m_cfg.scale),
-        int((e->pos().y() - m_cfg.y) / m_cfg.scale),
-        e->modifiers(),
-        e->buttons(),
-        e->type());
+    auto d = MakeMouseData(e);
     for (auto& Item : m_layout_items)
         Item->MouseEvent(d, m_cfg);
     if (e->button() == Qt::RightButton) {
@@ -224,16 +293,38 @@ void Layout::MousePressed(QMouseEvent* e)
         m_selection_start.clear();
         m_dragging = false;
     }
+
+    if (e->button() == Qt::LeftButton && !m_locked) {
+        m_lmb_pressed = true;
+        m_moving = false;
+        m_press_pos = e->pos();
+        m_move_source = CellAt(d); // the exact cell, resolved to the item once the drag starts
+    }
 }
 
 void Layout::MouseReleased(QMouseEvent* e)
 {
-    LayoutItem::MouseData d(
-        int((e->pos().x() - m_cfg.x) / m_cfg.scale),
-        int((e->pos().y() - m_cfg.y) / m_cfg.scale),
-        e->modifiers(),
-        e->buttons(),
-        e->type());
+    auto d = MakeMouseData(e);
+
+    if (m_moving && e->button() == Qt::LeftButton) {
+        bool changed;
+        {
+            std::lock_guard<std::mutex> lock(m_layout_mutex);
+            changed = MoveItem(m_move_source, CellAt(d));
+            for (auto& Item : m_layout_items)
+                Item->CancelClick();
+        }
+        m_moving = false;
+        m_lmb_pressed = false;
+        if (changed)
+            Config::Save();
+        return; // A drag is never a click
+    }
+    if (e->button() == Qt::LeftButton) {
+        m_lmb_pressed = false;
+        m_moving = false;
+    }
+
     for (auto& Item : m_layout_items)
         Item->MouseEvent(d, m_cfg);
     m_dragging = false;
@@ -241,15 +332,245 @@ void Layout::MouseReleased(QMouseEvent* e)
 
 void Layout::MouseDoubleClicked(QMouseEvent* e)
 {
-    LayoutItem::MouseData d(
-        int((e->pos().x() - m_cfg.x) / m_cfg.scale),
-        int((e->pos().y() - m_cfg.y) / m_cfg.scale),
-        e->modifiers(),
-        e->buttons(),
-        e->type());
+    auto d = MakeMouseData(e);
     d.double_click = true;
     for (auto& Item : m_layout_items)
         Item->MouseEvent(d, m_cfg);
+}
+
+bool Layout::MoveItem(LayoutItem::Cell const& from, LayoutItem::Cell const& to)
+{
+    auto* src = ItemAt(from.col, from.row);
+    auto* dst = ItemAt(to.col, to.row);
+    if (!src || !dst || src == dst)
+        return false;
+
+    // Same size: swap the two cells (keeps each cell's settings with it)
+    if (src->m_cell.w == dst->m_cell.w && src->m_cell.h == dst->m_cell.h) {
+        std::swap(src->m_cell, dst->m_cell);
+        src->Update(m_cfg);
+        dst->Update(m_cfg);
+        return true;
+    }
+
+    // Moving onto empty space: only if every cell it would cover is empty
+    LayoutItem::Cell target = src->m_cell;
+    target.col = to.col;
+    target.row = to.row;
+    if (target.right() <= m_cols && target.bottom() <= m_rows) {
+        bool free = true;
+        for (auto& item : m_layout_items) {
+            if (item.get() != src && item->m_cell.Overlaps(target) && !dynamic_cast<PlaceholderItem*>(item.get())) {
+                free = false;
+                break;
+            }
+        }
+        if (free) {
+            // Remove the empty cells under the new position
+            auto it = std::remove_if(m_layout_items.begin(), m_layout_items.end(), [&](std::unique_ptr<LayoutItem> const& item) {
+                return item.get() != src && item->m_cell.Overlaps(target);
+            });
+            m_layout_items.erase(it, m_layout_items.end());
+            src->m_cell = target;
+            src->Update(m_cfg);
+            FillEmptyCells();
+            return true;
+        }
+    }
+
+    // Different sizes: just exchange what the two cells show
+    auto* a = dynamic_cast<SourceItem*>(src);
+    auto* b = dynamic_cast<SourceItem*>(dst);
+    if (a && b) {
+        auto ra = a->GetSourceRef();
+        auto rb = b->GetSourceRef();
+        a->ApplySourceRef(rb);
+        b->ApplySourceRef(ra);
+        return true;
+    }
+    return false;
+}
+
+void Layout::DrawOutline(LayoutItem::Cell const& c, uint32_t color)
+{
+    int tx = c.col, ty = c.row, cx = c.w, cy = c.h;
+    // Top
+    LayoutItem::DrawBox(tx * m_cfg.cell_width, ty * m_cfg.cell_height - 1, cx * m_cfg.cell_width - 1, m_cfg.border + 1, color);
+    // Bottom
+    LayoutItem::DrawBox(tx * m_cfg.cell_width, (ty + cy) * m_cfg.cell_height - m_cfg.border - 2, cx * m_cfg.cell_width - 1, m_cfg.border + 2, color);
+    // Left
+    LayoutItem::DrawBox(tx * m_cfg.cell_width, ty * m_cfg.cell_height, m_cfg.border, cy * m_cfg.cell_height - 1, color);
+    // Right
+    LayoutItem::DrawBox((tx + cx) * m_cfg.cell_width - m_cfg.border - 2, ty * m_cfg.cell_height, m_cfg.border + 1, cy * m_cfg.cell_height - 1, color);
+}
+
+// ---------------------------------------------------------------------------
+// Hiding scenes: the following scene cells move up one position
+
+static QStringList ObsSceneNames()
+{
+    QStringList names;
+    struct obs_frontend_source_list scenes = {};
+    obs_frontend_get_scenes(&scenes);
+    for (size_t i = 0; i < scenes.sources.num; i++)
+        names.append(utf8_to_qt(obs_source_get_name(scenes.sources.array[i])));
+    obs_frontend_source_list_free(&scenes);
+    return names;
+}
+
+static bool ShownInMultiview(obs_source_t* src)
+{
+    OBSDataAutoRelease data = obs_source_get_private_settings(src);
+    obs_data_set_default_bool(data, "show_in_multiview", true);
+    return obs_data_get_bool(data, "show_in_multiview");
+}
+
+std::vector<SceneItem*> Layout::SceneItemsInOrder()
+{
+    std::vector<SceneItem*> result;
+    for (auto& item : m_layout_items) {
+        if (auto* si = dynamic_cast<SceneItem*>(item.get()))
+            result.push_back(si);
+    }
+    // Reading order: left to right, top to bottom
+    std::sort(result.begin(), result.end(), [](SceneItem* a, SceneItem* b) {
+        if (a->m_cell.row != b->m_cell.row)
+            return a->m_cell.row < b->m_cell.row;
+        return a->m_cell.col < b->m_cell.col;
+    });
+    return result;
+}
+
+void Layout::HideScene(QString const& name)
+{
+    if (name.isEmpty())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_layout_mutex);
+        if (!m_hidden_scenes.contains(name))
+            m_hidden_scenes.append(name);
+
+        auto items = SceneItemsInOrder();
+        std::vector<SourceItem::SourceRef> refs;
+        for (auto* si : items)
+            refs.push_back(si->GetSourceRef());
+
+        auto it = std::find_if(refs.begin(), refs.end(), [&](SourceItem::SourceRef const& r) { return r.name == name; });
+        if (it == refs.end()) {
+            // Not shown here, just remember it as hidden
+        } else {
+            refs.erase(it);
+
+            // Fill the freed slot at the end with the next scene that isn't shown yet
+            QStringList shown;
+            for (auto const& r : refs)
+                shown.append(r.name);
+            for (auto const& scene_name : ObsSceneNames()) {
+                if (shown.contains(scene_name) || m_hidden_scenes.contains(scene_name))
+                    continue;
+                OBSSourceAutoRelease src = obs_get_source_by_name(qt_to_utf8(scene_name));
+                if (!src || !ShownInMultiview(src))
+                    continue;
+                refs.push_back({ OBSSource(src.Get()), scene_name });
+                break;
+            }
+
+            for (size_t i = 0; i < items.size(); i++) {
+                if (i < refs.size()) {
+                    items[i]->ApplySourceRef(refs[i]);
+                } else {
+                    // Nothing left to show, turn the last cells into empty ones
+                    FreeSpace(items[i]->m_cell);
+                }
+            }
+            FillEmptyCells();
+        }
+    }
+    Config::Save();
+}
+
+void Layout::UnhideScene(QString const& name)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_layout_mutex);
+        m_hidden_scenes.removeAll(name);
+
+        OBSSourceAutoRelease src = obs_get_source_by_name(qt_to_utf8(name));
+        if (src && obs_scene_from_source(src)) {
+            auto items = SceneItemsInOrder();
+            std::vector<SourceItem::SourceRef> refs;
+            bool already_shown = false;
+            for (auto* si : items) {
+                refs.push_back(si->GetSourceRef());
+                already_shown |= si->SourceName() == name;
+            }
+
+            if (!already_shown) {
+                // Put it back where it belongs according to the OBS scene order
+                auto order = ObsSceneNames();
+                auto pos = order.indexOf(name);
+                size_t ins = refs.size();
+                for (size_t i = 0; i < refs.size(); i++) {
+                    auto idx = order.indexOf(refs[i].name);
+                    if (refs[i].IsEmpty() || idx < 0 || idx > pos) {
+                        ins = i;
+                        break;
+                    }
+                }
+                refs.insert(refs.begin() + ins, { OBSSource(src.Get()), name });
+
+                // Use up an empty scene cell after it instead of pushing the last scene out
+                for (size_t j = ins + 1; j < refs.size(); j++) {
+                    if (refs[j].IsEmpty()) {
+                        refs.erase(refs.begin() + j);
+                        break;
+                    }
+                }
+
+                // Still one too many: add a scene cell in the first free spot after the last one
+                if (refs.size() > items.size()) {
+                    LayoutItem* free_cell = nullptr;
+                    int last_row = items.empty() ? -1 : items.back()->m_cell.row;
+                    int last_col = items.empty() ? -1 : items.back()->m_cell.col;
+                    for (int y = 0; y < m_rows && !free_cell; y++) {
+                        for (int x = 0; x < m_cols && !free_cell; x++) {
+                            if (y < last_row || (y == last_row && x <= last_col))
+                                continue;
+                            auto* item = ItemAt(x, y);
+                            if (item && dynamic_cast<PlaceholderItem*>(item))
+                                free_cell = item;
+                        }
+                    }
+                    if (free_cell) {
+                        auto c = free_cell->m_cell;
+                        FreeSpace(c);
+                        auto* new_item = new SceneItem(this, c.col, c.row);
+                        new_item->Update(m_cfg);
+                        m_layout_items.emplace_back(new_item);
+                        items = SceneItemsInOrder();
+                    }
+                }
+
+                for (size_t i = 0; i < items.size() && i < refs.size(); i++)
+                    items[i]->ApplySourceRef(refs[i]);
+            }
+        }
+    }
+    Config::Save();
+}
+
+void Layout::UnhideAllScenes()
+{
+    // Restore in OBS scene order so each one lands in the right spot
+    auto order = ObsSceneNames();
+    auto hidden = m_hidden_scenes;
+    std::sort(hidden.begin(), hidden.end(), [&](QString const& a, QString const& b) {
+        return order.indexOf(a) < order.indexOf(b);
+    });
+    for (auto const& name : hidden)
+        UnhideScene(name);
+    m_hidden_scenes.clear();
+    Config::Save();
 }
 
 void Layout::HandleContextMenu(QMouseEvent*, QMenu& m)
@@ -266,11 +587,24 @@ void Layout::HandleContextMenu(QMouseEvent*, QMenu& m)
         m.addAction(T_MENU_LOCK, this, SLOT(Lock()));
         std::lock_guard<std::mutex> lock(m_layout_mutex);
 
+        if (!m_hidden_scenes.isEmpty()) {
+            auto* hidden_menu = m.addMenu(QString("%1 (%2)").arg(T_MENU_HIDDEN_SCENES).arg(m_hidden_scenes.size()));
+            for (auto const& name : std::as_const(m_hidden_scenes))
+                hidden_menu->addAction(name, this, [this, name] { UnhideScene(name); });
+            hidden_menu->addSeparator();
+            hidden_menu->addAction(T_MENU_SHOW_ALL_HIDDEN, this, [this] { UnhideAllScenes(); });
+        }
+
         for (auto& Item : m_layout_items) {
             if (Item->Hovered()) {
                 auto* sub_menu = m.addMenu(T_MENU_QUICK_ACTIONS);
                 sub_menu->addAction(T_MENU_FILL_ACTION, this, SLOT(FillSelectionWithScenes()));
                 sub_menu->addAction(T_MENU_CLEAR_ACTION, this, SLOT(ClearSelection()));
+                if (auto* si = dynamic_cast<SceneItem*>(Item.get())) {
+                    auto name = si->SourceName();
+                    if (!name.isEmpty())
+                        m.addAction(T_MENU_HIDE_SCENE, this, [this, name] { HideScene(name); });
+                }
                 m.addAction(T_MENU_SET_WIDGET, this, SLOT(ShowSetWidgetDialog()));
                 m.addSeparator();
                 Item->ContextMenu(m);
@@ -482,6 +816,9 @@ void Layout::Load(QJsonObject const& obj)
     m_cols = obj["cols"].toInt(4);
     m_rows = obj["rows"].toInt(4);
     m_locked = obj["locked"].toBool(false);
+    m_hidden_scenes.clear();
+    for (auto const& v : obj["hidden_scenes"].toArray())
+        m_hidden_scenes.append(v.toString());
     auto items = obj["items"].toArray();
 
     for (auto const& item : std::as_const(items)) {
@@ -510,6 +847,10 @@ void Layout::Save(QJsonObject& obj)
     obj["cols"] = m_cols;
     obj["rows"] = m_rows;
     obj["locked"] = m_locked;
+    QJsonArray hidden;
+    for (auto const& name : std::as_const(m_hidden_scenes))
+        hidden.append(name);
+    obj["hidden_scenes"] = hidden;
     for (auto const& Item : m_layout_items) {
         QJsonObject obj;
         Item->WriteToJson(obj);

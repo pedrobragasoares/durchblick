@@ -97,6 +97,8 @@ public:
 
     ~SceneItem() = default;
 
+    void CancelClick() override { m_lmb_down = false; }
+
     QWidget* GetConfigWidget() override;
     void LoadConfigFromWidget(QWidget*) override;
     void MouseEvent(MouseData const& e, DurchblickItemConfig const& cfg) override;

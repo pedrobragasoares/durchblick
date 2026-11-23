@@ -68,6 +68,8 @@ inline void GetScaleAndCenterPos(int baseCX, int baseCY, int windowCX,
     y = windowCY / 2 - newCY / 2;
 }
 
+class SceneItem;
+
 class Layout : public QObject {
     friend class LayoutConfigDialog;
     int m_cols { 4 }, m_rows { 4 };
@@ -77,7 +79,24 @@ class Layout : public QObject {
     LayoutItem::Cell m_hovered_cell {}, m_selection_start {}, m_selection_end {};
     bool m_dragging {}, m_locked {};
     std::mutex m_layout_mutex;
+
+    // Moving cells with the left mouse button (only while unlocked)
+    bool m_lmb_pressed {}, m_moving {};
+    QPoint m_press_pos;
+    LayoutItem::Cell m_move_source {}, m_move_target {};
+
+    // Scenes the user hid from this layout (by name)
+    QStringList m_hidden_scenes;
+
     Q_OBJECT
+
+    LayoutItem::MouseData MakeMouseData(QMouseEvent* e);
+    LayoutItem::Cell CellAt(LayoutItem::MouseData const& d) const;
+    // The following expect m_layout_mutex to be held
+    LayoutItem* ItemAt(int col, int row);
+    std::vector<SceneItem*> SceneItemsInOrder();
+    bool MoveItem(LayoutItem::Cell const& from, LayoutItem::Cell const& to);
+    void DrawOutline(LayoutItem::Cell const& c, uint32_t color);
 
     void GetSelection(int& tx, int& ty, int& cx, int& cy)
     {
@@ -111,6 +130,11 @@ private slots:
     void FillSelectionWithScenes();
 
 public:
+    void HideScene(QString const& name);
+    void UnhideScene(QString const& name);
+    void UnhideAllScenes();
+    QStringList const& HiddenScenes() const { return m_hidden_scenes; }
+
     // Reconnects cells that lost their source (e.g. after the scene list changed)
     void ResolveSources();
     Layout(Durchblick* parent, int cols = 4, int rows = 4);
