@@ -64,11 +64,6 @@ LayoutItem::Cell Layout::GetSelectedArea()
 {
     LayoutItem::Cell target = m_hovered_cell;
 
-    if (m_moving) {
-        DrawOutline(m_move_source, COLOR_SELECTION_CYAN);
-        DrawOutline(m_move_target, COLOR_PREVIEW_INDICATOR);
-    }
-
     if (m_dragging) {
         int tx, ty, cx, cy;
         GetSelection(tx, ty, cx, cy);
@@ -687,6 +682,11 @@ void Layout::Render(int, int, uint32_t, uint32_t)
         gs_matrix_pop();
     }
     m_layout_mutex.unlock();
+
+    if (m_moving) {
+        DrawOutline(m_move_source, COLOR_SELECTION_CYAN);
+        DrawOutline(m_move_target, COLOR_PREVIEW_INDICATOR);
+    }
 
     if (m_dragging) {
         int tx, ty, cx, cy;
